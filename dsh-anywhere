@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# dsh-anywhere — run DeepSeek Harness in Docker from any directory.
+set -Eeuo pipefail
+
+readonly IMAGE=dsh-anywhere:latest
+readonly CREDENTIALS_VOLUME=dsh-anywhere-credentials
+readonly LEGACY_VOLUME=dsh-anywhere-home
+
+die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+
+# Resolve the repository directory even when the launcher is a symlink.
+resolve_script_dir() {
+  local source=${BASH_SOURCE[0]} dir
+  while [[ -L $source ]]; do
+    dir=$(cd -P "$(dirname "$source")" || exit 1; pwd)
+    source=$(readlink "$source")
+    if [[ $source != /* ]]; then source=$dir/$source; fi
+  done
+  cd -P "$(dirname "$source")" || return 1
+  pwd
+}
+
+usage() {
+  cat <<'EOF'
+Run DeepSeek Harness in Docker from any directory.
+
+Usage: dsh-anywhere [DIRECTORY]
+
+Without DIRECTORY, the current directory is used. The directory is mounted at
+/workspace; each project gets its own settings volume and shares one API-key
+volume with every other project.
+
+Options:
+  -h, --help             this help
+
+The launcher runs in the foreground. Press Ctrl-C to stop. The container prints
+the browser URL and token link in this console; click that link.
+
+The first run asks for the API key in the browser and stores it in the shared
+dsh-anywhere-credentials volume. Later runs, including runs in other
+directories, reuse that key.
+EOF
+}
+
+project=
+
+while (($# > 0)); do
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    -*) die "unknown option: $1 (see --help)" ;;
+    *) [[ -z $project ]] || die "only one directory may be given"; project=$1; shift ;;
+  esac
+done
+
+if [[ -z $project ]]; then project=$PWD; fi
+[[ -d $project ]] || die "directory not found: $project"
+project=$(cd "$project" && pwd -P)
+
+slug=$(printf '%s' "$(basename "$project")" | LC_ALL=C tr -c 'A-Za-z0-9_.-' '-' | cut -c1-32)
+slug=${slug:-root}
+
+volume="dsh-anywhere-${slug}-$(printf '%s' "$project" | cksum | cut -d' ' -f1)"
+name="dsh-anywhere-${slug}-$(date +%H%M%S)-$RANDOM"
+
+git_name=$(git -C "$project" config user.name 2>/dev/null || true)
+git_email=$(git -C "$project" config user.email 2>/dev/null || true)
+author_name=${GIT_AUTHOR_NAME:-${git_name:-DSH Agent}}
+author_email=${GIT_AUTHOR_EMAIL:-${git_email:-dsh-agent@localhost}}
+committer_name=${GIT_COMMITTER_NAME:-${git_name:-DSH Agent}}
+committer_email=${GIT_COMMITTER_EMAIL:-${git_email:-dsh-agent@localhost}}
+
+free_port() {
+  python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()' 2>/dev/null
+}
+
+port=$(free_port) || die "could not pick a free port (python3 is required)"
+
+run_args=(
+  run --rm --init --name "$name"
+  --label dsh.anywhere=1
+  --label "dsh.workspace=${project}"
+  --user "$(id -u):$(id -g)"
+  --cap-drop=ALL
+  --security-opt=no-new-privileges:true
+  --read-only
+  --pids-limit=1024
+  --tmpfs /tmp:rw,nosuid,nodev,size=512m,mode=1777
+  --memory 4g
+  -p "127.0.0.1:${port}:${port}"
+  --mount "type=bind,src=${project},dst=/workspace"
+  --mount "type=volume,src=${volume},dst=/dsh"
+  --mount "type=volume,src=${CREDENTIALS_VOLUME},dst=/dsh-credentials"
+  -w /workspace
+  -e HOME=/dsh/home
+  -e DSH_HOME=/dsh/home
+  -e NARB_NATIVE_CACHE_DIR=/dsh/home/native-cache
+  -e "DSH_WEB_PORT=${port}"
+  -e "GIT_AUTHOR_NAME=${author_name}"
+  -e "GIT_AUTHOR_EMAIL=${author_email}"
+  -e "GIT_COMMITTER_NAME=${committer_name}"
+  -e "GIT_COMMITTER_EMAIL=${committer_email}"
+  "$IMAGE"
+)
+
+command -v docker >/dev/null 2>&1 || die "docker not found"
+docker info >/dev/null 2>&1 || die "docker daemon is not available"
+
+script_dir=$(resolve_script_dir)
+[[ -f "$script_dir/Dockerfile" ]] || die "no Dockerfile next to the launcher: $script_dir"
+printf 'Building image %s...\n' "$IMAGE"
+docker build -t "$IMAGE" -f "$script_dir/Dockerfile" "$script_dir" || die "image build failed"
+
+# On the first use of the shared credentials volume, carry over a key stored by
+# an older installation so the user does not have to enter it again.
+if ! docker volume inspect "$CREDENTIALS_VOLUME" >/dev/null 2>&1; then
+  migration_args=(
+    run --rm
+    --user "$(id -u):$(id -g)"
+    --entrypoint sh
+    -v "${CREDENTIALS_VOLUME}":/dsh-credentials
+    -v "${volume}":/dsh:ro
+  )
+  if docker volume inspect "$LEGACY_VOLUME" >/dev/null 2>&1; then
+    migration_args+=(-v "${LEGACY_VOLUME}":/dsh-legacy:ro)
+  fi
+  # The shell script runs inside the container, where $src and $tmp expand.
+  # shellcheck disable=SC2016
+  if ! docker "${migration_args[@]}" "$IMAGE" -c '
+    if [ -e /dsh-credentials/.credentials.yaml ]; then exit 0; fi
+    for src in /dsh/home/.credentials.yaml /dsh-legacy/home/.credentials.yaml; do
+      if [ -f "$src" ]; then
+        tmp=$(mktemp /dsh-credentials/.credentials.XXXXXX) || continue
+        if cp "$src" "$tmp" && chmod 600 "$tmp" && mv "$tmp" /dsh-credentials/.credentials.yaml; then
+          exit 0
+        fi
+        rm -f "$tmp"
+      fi
+    done
+  '; then
+    printf 'Warning: could not migrate the old key; DSH will ask for it.\n' >&2
+  fi
+fi
+
+printf 'Starting DeepSeek Harness\n'
+printf 'Workspace: /workspace (host: %s)\n' "$project"
+printf 'Container: %s\n' "$name"
+printf 'Settings: volume %s\n' "$volume"
+printf 'Credentials: volume %s\n' "$CREDENTIALS_VOLUME"
+printf 'Press Ctrl-C to stop.\n\n'
+exec docker "${run_args[@]}"

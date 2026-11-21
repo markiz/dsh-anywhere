@@ -1,0 +1,15 @@
+# dsh-anywhere profile overlay, applied by entrypoint.sh with --patch.
+#
+# One credentials document for every project volume, so the key entered once
+# through the Models page is reused by projects started later.
+- id: credentials
+  config:
+    path: /dsh-credentials/.credentials.yaml
+
+# The image points /dsh-defaults/deepseek-harness/default-workspace at
+# /workspace, so a fresh project volume registers the mounted project without
+# the folder picker (and without the "Unable to create default workspace"
+# notice).
+- id: workspace-controller
+  config:
+    documentsDirectory: /dsh-defaults
